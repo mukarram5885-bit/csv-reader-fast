@@ -1,101 +1,134 @@
-export function run({ text, header }) {
-  const s = text;
+export function run({ text: s, header }) {
   const n = s.length;
-  const F = closers(s);
+  if (n === 0) return { columns: null, rows: [], errors: [] };
+
+  // Pre-calculate closing quote positions in a single pass.
+  // F[i+1] will store the index of the closing quote for a field starting with a quote at index i.
+  const F = new Int32Array(n + 1);
+  F[n] = -1;
+  let r = 0;
+  for (let x = n - 1; x >= 0; x--) {
+    if (s.charCodeAt(x) === 34) {
+      r++;
+      F[x] = r & 1 ? x + r - 1 : F[x + r];
+    } else {
+      r = 0;
+      F[x] = F[x + 1];
+    }
+  }
+
   const errors = [];
   const records = [];
-  const rowOf = (k) => (header ? (k === 0 ? null : k - 1) : k);
-  let width = -1;
-  let i = n > 0 && s.charCodeAt(0) === 0xfeff ? 1 : 0;
+  let i = s.charCodeAt(0) === 0xfeff ? 1 : 0;
   let line = 1;
-
-  const readPlain = (recLine, row, state) => {
-    let out = "";
-    while (i < n) {
-      const ch = s.charCodeAt(i);
-      if (ch === 44 || ch === 10) break;
-      if (ch === 13) {
-        if (s.charCodeAt(i + 1) === 10) break;
-        errors.push({ code: "stray_cr", line: recLine, row });
-        i++;
-        continue;
-      }
-      let j = i + 1;
-      while (j < n) {
-        const c = s.charCodeAt(j);
-        if (c === 44 || c === 10 || c === 13) break;
-        j++;
-      }
-      out += s.slice(i, j);
-      state.started = true;
-      i = j;
-    }
-    return out;
-  };
+  let width = -1;
 
   while (i < n) {
-    const k = records.length;
-    const row = rowOf(k);
-    const recLine = line;
     const fields = [];
-    const state = { started: false };
+    const recLine = line;
+    // Match the exact row indexing logic of the reference.
+    const row = header ? (records.length === 0 ? null : records.length - 1) : records.length;
+    let started = false;
     let more = true;
 
     while (more) {
       let piece = "";
-
       if (i < n && s.charCodeAt(i) === 34 && F[i + 1] >= 0) {
-        state.started = true;
+        started = true;
         const c = F[i + 1];
         let j = i + 1;
         let seg = j;
+        // Quoted field: handle escapes and normalized newlines efficiently.
         while (j < c) {
           const ch = s.charCodeAt(j);
-          if (ch === 34) {
-            piece += s.slice(seg, j) + '"';
-            j += 2;
-            seg = j;
-          } else if (ch === 13) {
-            piece += s.slice(seg, j) + "\n";
-            j += s.charCodeAt(j + 1) === 10 ? 2 : 1;
-            line++;
-            seg = j;
-          } else if (ch === 10) {
-            piece += s.slice(seg, j) + "\n";
-            j++;
-            line++;
+          if (ch === 34 || ch === 10 || ch === 13) {
+            if (j > seg) piece += s.slice(seg, j);
+            if (ch === 34) {
+              piece += '"';
+              j += 2;
+            } else {
+              piece += "\n";
+              if (ch === 13 && s.charCodeAt(j + 1) === 10) j += 2;
+              else j++;
+              line++;
+            }
             seg = j;
           } else {
             j++;
           }
         }
-        piece += s.slice(seg, c);
+        if (j > seg) piece += s.slice(seg, j);
         i = c + 1;
 
-        const junk = readPlain(recLine, row, state);
-        if (junk.length > 0) errors.push({ code: "quote_junk", line: recLine, row });
-        piece += junk;
+        // Junk handling after a quoted field.
+        let out = "";
+        let junkStarted = false;
+        while (i < n) {
+          const ch = s.charCodeAt(i);
+          if (ch === 44 || ch === 10) break;
+          if (ch === 13) {
+            if (s.charCodeAt(i + 1) === 10) break;
+            errors.push({ code: "stray_cr", line: recLine, row });
+            i++;
+            continue;
+          }
+          let start = i;
+          while (i < n) {
+            const c2 = s.charCodeAt(i);
+            if (c2 === 44 || c2 === 10 || c2 === 13) break;
+            i++;
+          }
+          out += s.slice(start, i);
+          junkStarted = true;
+        }
+        if (junkStarted) {
+          started = true;
+          if (out.length > 0) errors.push({ code: "quote_junk", line: recLine, row });
+          piece += out;
+        }
       } else {
         if (i < n && s.charCodeAt(i) === 34) {
           errors.push({ code: "unterminated_quote", line: recLine, row });
         }
-        piece = readPlain(recLine, row, state);
+        // Plain field or unterminated quote: skip stray CRs and collect text.
+        let out = "";
+        while (i < n) {
+          const ch = s.charCodeAt(i);
+          if (ch === 44 || ch === 10) break;
+          if (ch === 13) {
+            if (s.charCodeAt(i + 1) === 10) break;
+            errors.push({ code: "stray_cr", line: recLine, row });
+            i++;
+            continue;
+          }
+          let start = i;
+          while (i < n) {
+            const c2 = s.charCodeAt(i);
+            if (c2 === 44 || c2 === 10 || c2 === 13) break;
+            i++;
+          }
+          out += s.slice(start, i);
+          started = true;
+        }
+        piece = out;
       }
 
       fields.push(piece);
 
+      // Check for delimiter and update state.
       if (i >= n) {
         more = false;
       } else {
         const ch = s.charCodeAt(i);
         if (ch === 44) {
           i++;
-          state.started = true;
+          started = true;
         } else if (ch === 10) {
           i++;
           line++;
           more = false;
         } else {
+          // CRLF (skips both 13 and 10) or stray CR (also skips 2 by reference logic).
           i += 2;
           line++;
           more = false;
@@ -103,9 +136,11 @@ export function run({ text, header }) {
       }
     }
 
-    if (!state.started) continue;
+    // Only add non-empty records (lines with at least one field or delimiter).
+    if (!started) continue;
 
-    if (k === 0) {
+    // Row length validation.
+    if (width === -1) {
       width = fields.length;
     } else if (fields.length < width) {
       errors.push({ code: "short_row", line: recLine, row, fields: fields.length });
@@ -119,23 +154,7 @@ export function run({ text, header }) {
 
   return {
     columns: header && records.length > 0 ? records[0] : null,
-    rows: records.slice(header ? 1 : 0),
+    rows: header ? records.slice(1) : records,
     errors,
   };
-}
-
-function closers(s) {
-  const n = s.length;
-  const F = new Int32Array(n + 1);
-  const run = new Int32Array(n + 1);
-  F[n] = -1;
-  for (let x = n - 1; x >= 0; x--) {
-    if (s.charCodeAt(x) !== 34) {
-      F[x] = F[x + 1];
-      continue;
-    }
-    const L = (run[x] = 1 + run[x + 1]);
-    F[x] = L & 1 ? x + L - 1 : F[x + L];
-  }
-  return F;
 }
